@@ -962,7 +962,7 @@ public class ExtendedEmailPublisher extends Notifier {
         // there is no SMTP transport when sending with SES
         executePostsendScript(context, msg, session, null);
 
-        if (context.getRun().getAction(MailMessageIdAction.class) == null && !messageIds.isEmpty()) {
+        if (context.getRun().getAction(MailMessageIdAction.class) == null) {
             context.getRun()
                     .addAction(new MailMessageIdAction(
                             SesMailSender.toMessageIdHeader(mailAccount.getAwsRegion(), messageIds.get(0))));

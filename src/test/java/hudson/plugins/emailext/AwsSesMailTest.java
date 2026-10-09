@@ -4,8 +4,10 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -22,13 +24,16 @@ import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
 import hudson.model.Run;
+import hudson.plugins.emailext.plugins.EmailTrigger;
 import hudson.plugins.emailext.plugins.recipients.ListRecipientProvider;
+import hudson.plugins.emailext.plugins.trigger.PreBuildTrigger;
 import hudson.plugins.emailext.plugins.trigger.SuccessTrigger;
 import hudson.tasks.MailMessageIdAction;
 import jakarta.mail.Address;
 import jakarta.mail.Session;
 import jakarta.mail.internet.InternetAddress;
 import jakarta.mail.internet.MimeMessage;
+import jakarta.mail.internet.NewsAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -42,6 +47,7 @@ import org.jvnet.hudson.test.WithoutJenkins;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 import org.jvnet.mock_javamail.Mailbox;
 import org.mockito.ArgumentCaptor;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.identity.spi.AwsCredentialsIdentity;
 import software.amazon.awssdk.services.sesv2.SesV2Client;
@@ -120,6 +126,54 @@ class AwsSesMailTest {
     }
 
     @Test
+    void stillValidatesSmtpServerWhenSesIsDisabled(JenkinsRule j) throws Exception {
+        ExtendedEmailPublisherDescriptor descriptor =
+                j.jenkins.getDescriptorByType(ExtendedEmailPublisherDescriptor.class);
+        descriptor.getMailAccount().setSmtpHost("invalid..host");
+
+        FreeStyleBuild build = buildAndNotify(j, "to@example.com");
+
+        j.assertLogContains("Mail account has invalid SMTP server", build);
+        j.assertLogNotContains("Amazon SES", build);
+    }
+
+    @Test
+    void keepsMessageIdOfFirstEmailForThreading(JenkinsRule j) throws Exception {
+        SesV2Client client = mock(SesV2Client.class);
+        when(client.sendEmail(any(SendEmailRequest.class)))
+                .thenReturn(SendEmailResponse.builder().messageId("first").build())
+                .thenReturn(SendEmailResponse.builder().messageId("second").build());
+        configureSes(j, "us-west-1", (acc, run) -> client);
+
+        FreeStyleBuild build = buildAndNotify(j, "to@example.com", preBuildTrigger(), successTrigger());
+
+        verify(client, times(2)).sendEmail(any(SendEmailRequest.class));
+        assertEquals("<first@us-west-1.amazonses.com>", build.getAction(MailMessageIdAction.class).messageId);
+    }
+
+    @Test
+    void countsSesEmailsTowardsThrottlingLimit(JenkinsRule j) throws Exception {
+        SesV2Client client = mock(SesV2Client.class);
+        when(client.sendEmail(any(SendEmailRequest.class)))
+                .thenReturn(SendEmailResponse.builder().messageId("id").build());
+        configureSes(j, "us-west-1", (acc, run) -> client).setThrottlingEnabled(true);
+        EmailThrottler throttler = EmailThrottler.getInstance();
+        throttler.resetEmailCount();
+        try {
+            for (int i = 0; i < EmailThrottler.THROTTLING_LIMIT - 1; i++) {
+                throttler.incrementEmailCount();
+            }
+            assertFalse(throttler.isThrottlingLimitExceeded());
+
+            buildAndNotify(j, "to@example.com");
+
+            assertTrue(throttler.isThrottlingLimitExceeded());
+        } finally {
+            throttler.resetEmailCount();
+        }
+    }
+
+    @Test
     @WithoutJenkins
     void splitsLargeRecipientListsIntoBatches() throws Exception {
         SesV2Client client = mock(SesV2Client.class);
@@ -155,6 +209,37 @@ class AwsSesMailTest {
         assertEquals(
                 10, captor.getAllValues().get(1).destination().toAddresses().size());
         assertNull(captor.getAllValues().get(0).configurationSetName());
+    }
+
+    @Test
+    @WithoutJenkins
+    void passesNonInternetAddressesAsIs() throws Exception {
+        SesV2Client client = mock(SesV2Client.class);
+        when(client.sendEmail(any(SendEmailRequest.class)))
+                .thenReturn(SendEmailResponse.builder().messageId("id").build());
+        MailAccount account = new MailAccount();
+        MimeMessage msg = new MimeMessage(Session.getInstance(new Properties()));
+        msg.setText("body");
+
+        SesMailSender.send(client, account, msg, new Address[] {new NewsAddress("jenkins.builds")});
+
+        ArgumentCaptor<SendEmailRequest> captor = ArgumentCaptor.forClass(SendEmailRequest.class);
+        verify(client).sendEmail(captor.capture());
+        assertEquals(List.of("jenkins.builds"), captor.getValue().destination().toAddresses());
+    }
+
+    @Test
+    @WithoutJenkins
+    void createClientUsesDefaultCredentialsProviderChainWithoutCredentialsId() {
+        MailAccount account = new MailAccount();
+        account.setUseAwsSes(true);
+        account.setAwsRegion("us-west-1");
+
+        try (SesV2Client client = SesMailSender.createClient(account, null)) {
+            assertThat(
+                    client.serviceClientConfiguration().credentialsProvider(),
+                    instanceOf(DefaultCredentialsProvider.class));
+        }
     }
 
     @Test
@@ -203,6 +288,11 @@ class AwsSesMailTest {
     }
 
     private static FreeStyleBuild buildAndNotify(JenkinsRule j, String recipients) throws Exception {
+        return buildAndNotify(j, recipients, successTrigger());
+    }
+
+    private static FreeStyleBuild buildAndNotify(JenkinsRule j, String recipients, EmailTrigger... triggers)
+            throws Exception {
         ExtendedEmailPublisher publisher = new ExtendedEmailPublisher();
         publisher.setFrom("");
         publisher.setContentType("default");
@@ -213,7 +303,14 @@ class AwsSesMailTest {
         publisher.setPresendScript("");
         publisher.setPostsendScript("");
         publisher.setReplyTo("");
-        SuccessTrigger trigger = new SuccessTrigger(
+        publisher.getConfiguredTriggers().addAll(List.of(triggers));
+        FreeStyleProject project = j.createFreeStyleProject();
+        project.getPublishersList().add(publisher);
+        return j.buildAndAssertSuccess(project);
+    }
+
+    private static SuccessTrigger successTrigger() {
+        return new SuccessTrigger(
                 Collections.singletonList(new ListRecipientProvider()),
                 "$DEFAULT_RECIPIENTS",
                 "",
@@ -222,9 +319,17 @@ class AwsSesMailTest {
                 "",
                 0,
                 "project");
-        publisher.getConfiguredTriggers().add(trigger);
-        FreeStyleProject project = j.createFreeStyleProject();
-        project.getPublishersList().add(publisher);
-        return j.buildAndAssertSuccess(project);
+    }
+
+    private static PreBuildTrigger preBuildTrigger() {
+        return new PreBuildTrigger(
+                Collections.singletonList(new ListRecipientProvider()),
+                "$DEFAULT_RECIPIENTS",
+                "",
+                "$DEFAULT_SUBJECT",
+                "$DEFAULT_CONTENT",
+                "",
+                0,
+                "project");
     }
 }
