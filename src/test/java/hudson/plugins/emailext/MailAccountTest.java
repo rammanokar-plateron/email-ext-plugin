@@ -217,4 +217,44 @@ class MailAccountTest {
         account.setSmtpHost(longHost);
         assertFalse(account.isSmtpServerValid());
     }
+
+    @Test
+    @WithoutJenkins
+    void testIsValidAwsSesConfig() {
+        MailAccount account = new MailAccount();
+        account.setAddress("foo@bar.com");
+        account.setUseAwsSes(true);
+        // the SMTP server is irrelevant when sending with SES
+        account.setSmtpHost("invalid..host");
+        assertFalse(account.isAwsSesValid());
+        assertFalse(account.isValid());
+
+        account.setAwsRegion("  eu-west-1  ");
+        assertEquals("eu-west-1", account.getAwsRegion());
+        assertTrue(account.isAwsSesValid());
+        assertTrue(account.isValid());
+
+        account.setUseAwsSes(false);
+        assertFalse(account.isValid());
+    }
+
+    @Test
+    @WithoutJenkins
+    void testAwsSesSettersNormalizeBlankValues() {
+        MailAccount account = new MailAccount();
+        account.setAwsRegion(" ");
+        account.setAwsCredentialsId("");
+        account.setSesConfigurationSet("  ");
+        assertNull(account.getAwsRegion());
+        assertNull(account.getAwsCredentialsId());
+        assertNull(account.getSesConfigurationSet());
+    }
+
+    @Test
+    void testDoCheckAwsRegion(JenkinsRule j) {
+        MailAccountDescriptor descriptor = new MailAccountDescriptor();
+        assertThat(descriptor.doCheckAwsRegion(""), hasKind(Kind.ERROR));
+        assertThat(descriptor.doCheckAwsRegion("us-east-1"), hasKind(Kind.OK));
+        assertThat(descriptor.doCheckAwsRegion("mars-north-1"), hasKind(Kind.WARNING));
+    }
 }

@@ -101,6 +101,8 @@ import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.Stapler;
 import org.kohsuke.stapler.StaplerRequest2;
+import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.services.sesv2.SesV2Client;
 
 /**
  * {@link Publisher} that sends notification e-mail.
@@ -734,6 +736,8 @@ public class ExtendedEmailPublisher extends Notifier {
                                 context.getListener().getLogger(),
                                 "Additional account has invalid from address " + mailAccount.getAddress());
                     }
+                } else if (!mailAccount.isAwsSesValid()) {
+                    context.getListener().getLogger().println("Mail account uses Amazon SES but has no AWS region");
                 } else if (!mailAccount.isSmtpServerValid()) {
                     context.getListener().getLogger().println("Mail account has invalid SMTP server");
                     if (mailAccount.isDefaultAccount()) {
@@ -793,6 +797,10 @@ public class ExtendedEmailPublisher extends Notifier {
 
                     // emergency reroute might have modified recipients:
                     allRecipients = msg.getAllRecipients();
+                    if (mailAccount.isUseAwsSes()) {
+                        sendWithAwsSes(context, mailAccount, msg, session, allRecipients);
+                        return true;
+                    }
                     // all email addresses are of type "rfc822", so just take first one:
                     Transport transport = session.getTransport(allRecipients[0]);
                     while (true) {
@@ -921,6 +929,9 @@ public class ExtendedEmailPublisher extends Notifier {
         } catch (MessagingException e) {
             LOGGER.log(Level.WARNING, "SMTP communication error while sending email.", e);
             Functions.printStackTrace(e, context.getListener().error("SMTP communication error while sending email."));
+        } catch (SdkException e) {
+            LOGGER.log(Level.WARNING, "Amazon SES error while sending email.", e);
+            Functions.printStackTrace(e, context.getListener().error("Amazon SES error while sending email."));
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Unexpected error while sending email.", e);
             Functions.printStackTrace(e, context.getListener().error("Unexpected error while sending email."));
@@ -928,6 +939,34 @@ public class ExtendedEmailPublisher extends Notifier {
 
         debug(context.getListener().getLogger(), "Email sending failed. Please check Jenkins system log for details.");
         return false;
+    }
+
+    private void sendWithAwsSes(
+            ExtendedEmailPublisherContext context,
+            MailAccount mailAccount,
+            MimeMessage msg,
+            Session session,
+            Address[] recipients)
+            throws IOException, MessagingException {
+        List<String> messageIds;
+        try (SesV2Client client = getDescriptor().createSesClient(mailAccount, context)) {
+            messageIds = SesMailSender.send(client, mailAccount, msg, recipients);
+        }
+        context.getListener()
+                .getLogger()
+                .println("Sent email with Amazon SES, message id(s): " + String.join(", ", messageIds));
+        if (getDescriptor().isThrottlingEnabled()) {
+            EmailThrottler.getInstance().incrementEmailCount();
+        }
+
+        // there is no SMTP transport when sending with SES
+        executePostsendScript(context, msg, session, null);
+
+        if (context.getRun().getAction(MailMessageIdAction.class) == null && !messageIds.isEmpty()) {
+            context.getRun()
+                    .addAction(new MailMessageIdAction(
+                            SesMailSender.toMessageIdHeader(mailAccount.getAwsRegion(), messageIds.get(0))));
+        }
     }
 
     public List<TokenMacro> getRuntimeMacros(ExtendedEmailPublisherContext context) {

@@ -50,6 +50,7 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest2;
+import software.amazon.awssdk.services.sesv2.SesV2Client;
 
 /**
  * These settings are global configurations
@@ -211,6 +212,8 @@ public final class ExtendedEmailPublisherDescriptor extends BuildStepDescriptor<
                     return new PasswordAuthentication(c.getUsername(), Secret.toString(c.getPassword()));
                 }
             };
+
+    private transient BiFunction<MailAccount, Run<?, ?>, SesV2Client> sesClientProvider = SesMailSender::createClient;
 
     private Object readResolve() {
         if (smtpHost != null) {
@@ -936,6 +939,15 @@ public final class ExtendedEmailPublisherDescriptor extends BuildStepDescriptor<
 
     void setAuthenticatorProvider(BiFunction<MailAccount, Run<?, ?>, Authenticator> authenticatorProvider) {
         this.authenticatorProvider = authenticatorProvider;
+    }
+
+    @Restricted(NoExternalUse.class)
+    SesV2Client createSesClient(MailAccount acc, ExtendedEmailPublisherContext context) {
+        return sesClientProvider.apply(acc, context.getRun());
+    }
+
+    void setSesClientProvider(BiFunction<MailAccount, Run<?, ?>, SesV2Client> sesClientProvider) {
+        this.sesClientProvider = sesClientProvider;
     }
 
     @SuppressWarnings({"lgtm/jenkins/csrf", "lgtm/jenkins/no-permission-check"})
